@@ -8,54 +8,65 @@
         Welcome to the patch verification playbook.
         Here are the available groups for verification:
         {{ groups.keys() | difference(['all','ungrouped']) | sort | to_nice_yaml }}
-        Please provide a function/site to verify [ex. yum, dokuwiki,...] or press Enter for default (all).
+        Provide a function/site to verify [ex. yum, dokuwiki,...] or
+        press Enter for default (all).
       private: false
-      default: all
+      default: "all"
 
   tasks:
     - name: Save prompt vars to fact
       run_once: true
       delegate_to: localhost
       delegate_facts: true
-      ansible.builtin.set_fact:
+      set_fact:
         run_scope: "{{ scope_run }}"
 
-#=======================================================================#
-#                         Play Separator                                #
-#=======================================================================#
+# ======================================================= #
+#                 Host Errata Gathering                   #
+# ======================================================= #
 - name: Gather initial info about erratum and host status
   hosts: "{{ hostvars['localhost']['run_scope'] }}"
   gather_facts: false
   become: true
   vars:
-    non_applicable_message: "No packages were found for this Errata ID, erratum is assumed non applicable to this host. Please verify manually."
+    non_applicable_message: >
+      No packages were found for this Errata ID, erratum is assumed
+      non applicable to this host. Please verify manually.
   vars_files:
     - vars/approved_list.yml
 
   tasks:
-    - name: DEFAULT: create an intersection of the applicable errata and approved errata
+    - name: DEFAULT create intersection of applicable and approved errata
       ansible.builtin.set_fact:
         needed_errata: "{{ (errata | default([])) | intersect(valid_errata | default([])) }}"
         verification_mode: "normal"
         cacheable: true
 
-    - name: FAILBACK: Check if needed errata is empty - switch to manual mode
+    - name: FAILBACK switch to manual mode if needed_errata empty
       ansible.builtin.set_fact:
         needed_errata: "{{ valid_errata | default([]) }}"
         verification_mode: "manual"
         cacheable: true
-      when: needed_errata | length == 0 and valid_errata | default([]) | length > 0
+      when:
+        - needed_errata | length == 0
+        - valid_errata | default([]) | length > 0
 
     - name: Gather applied errata IDs
-      ansible.builtin.shell: |
-        yum updateinfo list installed | grep -E "\b({{ needed_errata | join('|') }})\b"
+      ansible.builtin.shell: >
+        yum updateinfo list installed | grep -E "\b({{ needed_errata
+        | join('|') }})\b"
       register: yum_out
       ignore_errors: true
       when: needed_errata | length > 0
 
     - name: Parse applied errata from yum output
       ansible.builtin.set_fact:
-        applied_errata: "{{ needed_errata | intersect(yum_out.stdout_lines | map('regex_search', '(RH[A-Z]+-[0-9]{4}:[0-9]+)') | select('string') | list) }}"
+        applied_errata: >-
+          {{ needed_errata | intersect(
+             yum_out.stdout_lines
+             | map('regex_search', '(RH[A-Z]+-[0-9]{4}:[0-9]+)')
+             | select('string') | list
+          ) }}
         cacheable: true
       when:
         - needed_errata | length > 0
@@ -74,7 +85,8 @@
         cacheable: true
 
     - name: Determine if errata applies to host
-      ansible.builtin.shell: "dnf updateinfo info --available {{ item }} 2>/dev/null"
+      ansible.builtin.shell: >
+        dnf updateinfo info --available {{ item }} 2>/dev/null
       loop: "{{ missing_errata }}"
       register: errata_info
       changed_when: false
@@ -88,7 +100,8 @@
 
     - name: Classify Errata as applicable
       ansible.builtin.set_fact:
-        applicable_errata: "{{ applicable_errata + [{'errata_id': item.item, 'details': item.stdout}] }}"
+        applicable_errata: >-
+          {{ applicable_errata + [ { 'errata_id': item.item, 'details': item.stdout } ] }}
         cacheable: true
       loop: "{{ errata_info.results | default([]) }}"
       when:
@@ -98,7 +111,9 @@
 
     - name: Classify Errata as non applicable
       ansible.builtin.set_fact:
-        non_applicable_errata: "{{ non_applicable_errata + [{'errata_id': item.item, 'details': non_applicable_message}] }}"
+        non_applicable_errata: >-
+          {{ non_applicable_errata + [ { 'errata_id': item.item,
+            'details': non_applicable_message } ] }}
         cacheable: true
       loop: "{{ errata_info.results | default([]) }}"
       when:
@@ -118,15 +133,17 @@
           {%- endif -%}
         cacheable: true
 
-    - name: Extract package information for applicable errata
-      ansible.builtin.shell: "dnf updateinfo info --available {{ item.errata_id }} 2>/dev/null"
+    - name: Extract package info for applicable errata
+      ansible.builtin.shell: >
+        dnf updateinfo info --available {{ item.errata_id }} 2>/dev/null
       loop: "{{ applicable_errata }}"
       register: applicable_errata_package_info
       changed_when: false
       when: applicable_errata | length > 0
 
-    - name: Extract package information for non-applicable errata
-      ansible.builtin.shell: "dnf updateinfo info {{ item.errata_id }} 2>/dev/null"
+    - name: Extract package info for non-applicable errata
+      ansible.builtin.shell: >
+        dnf updateinfo info {{ item.errata_id }} 2>/dev/null
       loop: "{{ non_applicable_errata }}"
       register: non_applicable_errata_package_info
       changed_when: false
@@ -137,7 +154,9 @@
         applicable_errata_package_details: >-
           {{- applicable_errata_package_details | default({}) | combine({
             item.item.errata_id: {
-              'packages': item.stdout.split('\n') | select('match', '^\\s+[^\\s].*\\.(x86_64|noarch|i686|aarch64|s390x|ppc64le)\\s*$') | map('trim') | list,
+              'packages': item.stdout.split('\n') 
+                | select('match', '^\\s+[^\\s].*\\.(x86_64|noarch|i686|aarch64|s390x|ppc64le)\\s*$')
+                | map('trim') | list,
               'full_info': item.stdout,
               'cves': item.stdout | regex_findall('CVE-[0-9]{4}-[0-9]+'),
               'type': item.stdout | regex_search('Type:\\s*(\\w+)', '\\1') | first | default('unknown'),
@@ -155,7 +174,9 @@
         non_applicable_errata_package_details: >-
           {{- non_applicable_errata_package_details | default({}) | combine({
             item.item.errata_id: {
-              'packages': item.stdout.split('\n') | select('match', '^\\s+[^\\s].*\\.(x86_64|noarch|i686|aarch64|s390x|ppc64le)\\s*$') | map('trim') | list,
+              'packages': item.stdout.split('\n') 
+                | select('match', '^\\s+[^\\s].*\\.(x86_64|noarch|i686|aarch64|s390x|ppc64le)\\s*$')
+                | map('trim') | list,
               'full_info': item.stdout,
               'cves': item.stdout | regex_findall('CVE-[0-9]{4}-[0-9]+'),
               'type': item.stdout | regex_search('Type:\\s*(\\w+)', '\\1') | first | default('unknown'),
@@ -172,5 +193,220 @@
     - name: Combine all errata package details for reporting
       ansible.builtin.set_fact:
         all_errata_package_details: >-
-          {{- applicable_errata_package_details | default({}) | combine(non_applicable_errata_package_details | default({})) -}}
+          {{- applicable_errata_package_details | default({}) | combine(
+              non_applicable_errata_package_details | default({})
+          ) -}}
       cacheable: true
+
+# ======================================================= #
+#            Verification Report Generation               #
+# ======================================================= #
+- name: Generate verification reports by primary group
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - vars/approved_list.yml
+  vars:
+    email_recipient: "email@example.com"
+    target_hosts: >-
+      {%- if hostvars['localhost']['run_scope'] != 'all' -%}
+      {{ groups[hostvars['localhost']['run_scope']] | default([]) }}
+      {%- else -%}
+      {{ groups['all'] }}
+      {%- endif -%}
+
+  tasks:
+    - name: Collect primary groups from hosts
+      ansible.builtin.set_fact:
+        primary_groups: >-
+          {{- primary_groups | default([]) + [hostvars[item].get('primary_group', 'unassigned')] -}}
+      loop: "{{ target_hosts }}"
+      when:
+        - hostvars[item].get('status') is defined
+        - item in target_hosts
+
+    - name: Get unique primary groups
+      ansible.builtin.set_fact:
+        unique_groups: "{{ primary_groups | default([]) | unique | sort }}"
+
+    - name: Create verification lists by group
+      ansible.builtin.set_fact:
+        verification_reports: >-
+          {{- verification_reports | default({}) | combine({
+            group_name: {
+              'hosts_to_verify': [],
+              'compliant_hosts': [],
+              'hosts_not_applicable': []
+            }
+          }) -}}
+      vars:
+        group_name: "{{ item }}"
+      loop: "{{ unique_groups }}"
+
+    - name: Populate verification lists
+      ansible.builtin.set_fact:
+        verification_reports: >-
+          {{- verification_reports | combine({
+            host_group: verification_reports[host_group] | combine({
+              list_name: verification_reports[host_group][list_name] + [{
+                'hostname': item,
+                'missing_errata': hostvars[item].get('missing_errata', []),
+                'applicable_errata': hostvars[item].get('applicable_errata', []),
+                'non_applicable_errata': hostvars[item].get('non_applicable_errata', []),
+                'verification_mode': hostvars[item].get('verification_mode', 'normal')
+              }]
+            })
+          }) -}}
+      vars:
+        host_group: "{{ hostvars[item].get('primary_group', 'unassigned') }}"
+        list_name: >-
+          {%- if hostvars[item].get('status') == 'needs_patches' -%}
+          hosts_to_verify
+          {%- elif hostvars[item].get('status') == 'not_applicable' -%}
+          hosts_not_applicable
+          {%- else -%}
+          compliant_hosts
+          {%- endif -%}
+      loop: "{{ target_hosts }}"
+      when:
+        - hostvars[item].get('status') is defined
+        - item in target_hosts
+    - name: Write detailed verification report for each group
+      ansible.builtin.copy:
+        dest: "./verification_{{ item }}.txt"
+        content: |-
+          DISA-JRSS Patch Verification Report - {{ item | upper }}
+          Scope: {{ hostvars['localhost']['run_scope'] }}
+          =================================================
+          HOSTS TO VERIFY ({{ verification_reports[item].hosts_to_verify | length }}):
+          =================================================
+          {% for host in verification_reports[item].hosts_to_verify %}
+          {{ host.hostname }}:
+            Applicable Errata ({{ host.applicable_errata | length }}):
+            {% for errata in host.applicable_errata %}
+              - {{ errata.errata_id }} [NEEDS PATCHING]
+            {% endfor %}
+            {% if host.non_applicable_errata | length > 0 %}
+            Non-Applicable Errata ({{ host.non_applicable_errata | length }}):
+              {% for errata in host.non_applicable_errata %}
+              - {{ errata.errata_id }} [NOT APPLICABLE]
+              {% endfor %}
+            {% endif %}
+          {% endfor %}
+          =================================================
+          NOT APPLICABLE HOSTS ({{ verification_reports[item].hosts_not_applicable | length }}):
+          =================================================
+          {% for host in verification_reports[item].hosts_not_applicable %}
+          {{ host.hostname }}:
+            {% for errata in host.missing_errata %}
+            - {{ errata }} [NOT APPLICABLE - packages not installed]
+            {% endfor %}
+          {% endfor %}
+          =================================================
+          COMPLIANT HOSTS ({{ verification_reports[item].compliant_hosts | length }}):
+          =================================================
+          {% for host in verification_reports[item].compliant_hosts %}
+          {{ host.hostname }} - OK
+          {% endfor %}
+          Summary for {{ item }}:
+            - Total hosts: {{ verification_reports[item].hosts_to_verify | length 
+                             + verification_reports[item].compliant_hosts | length
+                             + verification_reports[item].hosts_not_applicable | length }}
+            - Need verification: {{ verification_reports[item].hosts_to_verify | length }}
+            - Not applicable: {{ verification_reports[item].hosts_not_applicable | length }}
+            - Compliant: {{ verification_reports[item].compliant_hosts | length }}
+      mode: '0644'
+      loop: "{{ unique_groups }}"
+
+    - name: Write detailed package information for each group
+      ansible.builtin.copy:
+        dest: "./missing_errata_{{ item }}.txt"
+        content: |-
+          DISA-JRSS Missing Errata Details - {{ item | upper }}
+          Scope: {{ hostvars['localhost']['run_scope'] }}
+          =================================================================
+          DETAILED ERRATA AND PACKAGE INFORMATION BY HOST:
+          =================================================================
+          {% for host in verification_reports[item].hosts_to_verify %}
+          {{ host.hostname }} - VERIFICATION REQUIRED
+          {% if host.applicable_errata | length > 0 %}
+          ┌─ APPLICABLE ERRATA ({{ host.applicable_errata | length }})
+          │
+          {% for errata in host.applicable_errata %}
+          ├── {{ errata.errata_id }}
+          │   {% set pkg_details = hostvars[host.hostname].applicable_errata_package_details[errata.errata_id] | default({}) %}
+          │   ├─ Severity: {{ pkg_details.severity | default('Unknown') }}
+          │   ├─ Type: {{ pkg_details.type | default('unknown') }}
+          │   ├─ CVEs: {{ pkg_details.cves | join(', ') if pkg_details.cves | length > 0 else 'None listed' }}
+          │   ├─ Description: {{ pkg_details.description | default('No description') }}
+          │   ├─ PACKAGES TO UPDATE ({{ pkg_details.packages | length }}):
+          │     {% for package in pkg_details.packages %}
+          │     - {{ package }}
+          │     {% endfor %}
+          │     {% if pkg_details.packages | length == 0 %}
+          │     - No specific packages identified - manual verification required
+          │     {% endif %}
+          {% endfor %}
+          └─
+          {% endif %}
+          {% endfor %}
+          {% if verification_reports[item].hosts_not_applicable | length > 0 %}
+          =================================================================
+          HOSTS WITH NON-APPLICABLE ERRATA:
+          =================================================================
+          {% for host in verification_reports[item].hosts_not_applicable %}
+          {{ host.hostname }} - ERRATA NOT APPLICABLE
+          ┌─ ERRATA NOT APPLICABLE ({{ host.missing_errata | length }})
+          │  This host does not have any of the packages affected by the
+          │  target errata. Errata that don't apply to this host:
+          {% for errata in host.missing_errata %}
+          │  - {{ errata }}
+          {% endfor %}
+          └─
+          {% endfor %}
+          {% endif %}
+      mode: '0644'
+      loop: "{{ unique_groups }}"
+
+    - name: Create overall summary
+      ansible.builtin.copy:
+        dest: "./verification_summary.txt"
+        content: |-
+          DISA-JRSS Patch Verification Summary
+          Scope: {{ hostvars['localhost']['run_scope'] }}
+          HOSTS TO VERIFY (APPLICABLE ERRATA):
+          ====================================
+          {% for group in unique_groups %}
+          {% for host in verification_reports[group].hosts_to_verify %}
+          {{ host.hostname }} ({{ group }}) - {{ host.applicable_errata | length }}
+          applicable patches needed
+          {% endfor %}
+          {% endfor %}
+          HOSTS WITH NON-APPLICABLE ERRATA:
+          ==================================
+          {% for group in unique_groups %}
+          {% for host in verification_reports[group].hosts_not_applicable %}
+          {{ host.hostname }} ({{ group }}) - {{ host.missing_errata | length }} 
+          non-applicable patches
+          {% endfor %}
+          {% endfor %}
+          SUMMARY BY GROUP:
+          =================
+          {% for group in unique_groups %}
+          {{ group }}:
+            - Need verification: {{ verification_reports[group].hosts_to_verify | length }}
+            - Not applicable: {{ verification_reports[group].hosts_not_applicable | length }}
+            - Compliant: {{ verification_reports[group].compliant_hosts | length }}
+          {% endfor %}
+      mode: '0644'
+
+    - name: Send emails per group
+      ansible.builtin.shell: >
+        mail -s "Patch Verification - {{ item | upper }}"
+        -a "./verification_{{ item }}.txt"
+        -a "./missing_errata_{{ item }}.txt"
+        -a "./verification_summary.txt"
+        -r Ansible {{ email_recipient }} < "./verification_{{ item }}.txt"
+      loop: "{{ unique_groups }}"
+      when: unique_groups | length > 0
+      ignore_errors: true
