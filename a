@@ -1,0 +1,176 @@
+---
+- name: Gathering and verifying user input
+  hosts: localhost
+  gather_facts: false
+  vars_prompt:
+    - name: scope_run
+      prompt: |
+        Welcome to the patch verification playbook.
+        Here are the available groups for verification:
+        {{ groups.keys() | difference(['all','ungrouped']) | sort | to_nice_yaml }}
+        Please provide a function/site to verify [ex. yum, dokuwiki,...] or press Enter for default (all).
+      private: false
+      default: all
+
+  tasks:
+    - name: Save prompt vars to fact
+      run_once: true
+      delegate_to: localhost
+      delegate_facts: true
+      ansible.builtin.set_fact:
+        run_scope: "{{ scope_run }}"
+
+#=======================================================================#
+#                         Play Separator                                #
+#=======================================================================#
+- name: Gather initial info about erratum and host status
+  hosts: "{{ hostvars['localhost']['run_scope'] }}"
+  gather_facts: false
+  become: true
+  vars:
+    non_applicable_message: "No packages were found for this Errata ID, erratum is assumed non applicable to this host. Please verify manually."
+  vars_files:
+    - vars/approved_list.yml
+
+  tasks:
+    - name: DEFAULT: create an intersection of the applicable errata and approved errata
+      ansible.builtin.set_fact:
+        needed_errata: "{{ (errata | default([])) | intersect(valid_errata | default([])) }}"
+        verification_mode: "normal"
+        cacheable: true
+
+    - name: FAILBACK: Check if needed errata is empty - switch to manual mode
+      ansible.builtin.set_fact:
+        needed_errata: "{{ valid_errata | default([]) }}"
+        verification_mode: "manual"
+        cacheable: true
+      when: needed_errata | length == 0 and valid_errata | default([]) | length > 0
+
+    - name: Gather applied errata IDs
+      ansible.builtin.shell: |
+        yum updateinfo list installed | grep -E "\b({{ needed_errata | join('|') }})\b"
+      register: yum_out
+      ignore_errors: true
+      when: needed_errata | length > 0
+
+    - name: Parse applied errata from yum output
+      ansible.builtin.set_fact:
+        applied_errata: "{{ needed_errata | intersect(yum_out.stdout_lines | map('regex_search', '(RH[A-Z]+-[0-9]{4}:[0-9]+)') | select('string') | list) }}"
+        cacheable: true
+      when:
+        - needed_errata | length > 0
+        - yum_out is succeeded
+        - yum_out.stdout_lines is defined
+
+    - name: Initialize applied_errata if not set
+      ansible.builtin.set_fact:
+        applied_errata: []
+        cacheable: true
+      when: applied_errata is not defined
+
+    - name: Determine missing errata
+      ansible.builtin.set_fact:
+        missing_errata: "{{ needed_errata | difference(applied_errata) }}"
+        cacheable: true
+
+    - name: Determine if errata applies to host
+      ansible.builtin.shell: "dnf updateinfo info --available {{ item }} 2>/dev/null"
+      loop: "{{ missing_errata }}"
+      register: errata_info
+      changed_when: false
+      when: missing_errata | length > 0
+
+    - name: Initialize errata categorization
+      ansible.builtin.set_fact:
+        applicable_errata: []
+        non_applicable_errata: []
+        cacheable: true
+
+    - name: Classify Errata as applicable
+      ansible.builtin.set_fact:
+        applicable_errata: "{{ applicable_errata + [{'errata_id': item.item, 'details': item.stdout}] }}"
+        cacheable: true
+      loop: "{{ errata_info.results | default([]) }}"
+      when:
+        - errata_info is defined
+        - item.stdout is defined
+        - "'Packages:' in item.stdout"
+
+    - name: Classify Errata as non applicable
+      ansible.builtin.set_fact:
+        non_applicable_errata: "{{ non_applicable_errata + [{'errata_id': item.item, 'details': non_applicable_message}] }}"
+        cacheable: true
+      loop: "{{ errata_info.results | default([]) }}"
+      when:
+        - errata_info is defined
+        - item.stdout is defined
+        - "'Packages:' not in item.stdout"
+
+    - name: Determine status
+      ansible.builtin.set_fact:
+        status: >-
+          {%- if missing_errata | length == 0 -%}
+          compliant
+          {%- elif applicable_errata | length > 0 -%}
+          needs_patches
+          {%- else -%}
+          not_applicable
+          {%- endif -%}
+        cacheable: true
+
+    - name: Extract package information for applicable errata
+      ansible.builtin.shell: "dnf updateinfo info --available {{ item.errata_id }} 2>/dev/null"
+      loop: "{{ applicable_errata }}"
+      register: applicable_errata_package_info
+      changed_when: false
+      when: applicable_errata | length > 0
+
+    - name: Extract package information for non-applicable errata
+      ansible.builtin.shell: "dnf updateinfo info {{ item.errata_id }} 2>/dev/null"
+      loop: "{{ non_applicable_errata }}"
+      register: non_applicable_errata_package_info
+      changed_when: false
+      when: non_applicable_errata | length > 0
+
+    - name: Parse applicable errata package details
+      ansible.builtin.set_fact:
+        applicable_errata_package_details: >-
+          {{- applicable_errata_package_details | default({}) | combine({
+            item.item.errata_id: {
+              'packages': item.stdout.split('\n') | select('match', '^\\s+[^\\s].*\\.(x86_64|noarch|i686|aarch64|s390x|ppc64le)\\s*$') | map('trim') | list,
+              'full_info': item.stdout,
+              'cves': item.stdout | regex_findall('CVE-[0-9]{4}-[0-9]+'),
+              'type': item.stdout | regex_search('Type:\\s*(\\w+)', '\\1') | first | default('unknown'),
+              'description': item.stdout | regex_search('Description:\\s*([^\\n]+)', '\\1') | first | default('No description'),
+              'severity': item.stdout | regex_search('(Critical|Important|Moderate|Low):', '\\1') | first | default('Unknown'),
+              'update_id': item.stdout | regex_search('Update ID:\\s*([^\\n]+)', '\\1') | first | default('Unknown')
+            }
+          }) -}}
+      loop: "{{ applicable_errata_package_info.results | default([]) }}"
+      when: applicable_errata_package_info is defined
+      cacheable: true
+
+    - name: Parse non-applicable errata package details
+      ansible.builtin.set_fact:
+        non_applicable_errata_package_details: >-
+          {{- non_applicable_errata_package_details | default({}) | combine({
+            item.item.errata_id: {
+              'packages': item.stdout.split('\n') | select('match', '^\\s+[^\\s].*\\.(x86_64|noarch|i686|aarch64|s390x|ppc64le)\\s*$') | map('trim') | list,
+              'full_info': item.stdout,
+              'cves': item.stdout | regex_findall('CVE-[0-9]{4}-[0-9]+'),
+              'type': item.stdout | regex_search('Type:\\s*(\\w+)', '\\1') | first | default('unknown'),
+              'description': item.stdout | regex_search('Description:\\s*([^\\n]+)', '\\1') | first | default('No description'),
+              'severity': item.stdout | regex_search('(Critical|Important|Moderate|Low):', '\\1') | first | default('Unknown'),
+              'update_id': item.stdout | regex_search('Update ID:\\s*([^\\n]+)', '\\1') | first | default('Unknown'),
+              'reason': 'Packages not installed on this system'
+            }
+          }) -}}
+      loop: "{{ non_applicable_errata_package_info.results | default([]) }}"
+      when: non_applicable_errata_package_info is defined
+      cacheable: true
+
+    - name: Combine all errata package details for reporting
+      ansible.builtin.set_fact:
+        all_errata_package_details: >-
+          {{- applicable_errata_package_details | default({}) | combine(non_applicable_errata_package_details | default({})) -}}
+      cacheable: true
